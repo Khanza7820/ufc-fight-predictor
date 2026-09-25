@@ -177,6 +177,7 @@ def plot_reliability_diagram(
     n_bins: int = 10,
     variants: tuple = ("raw_probs", "platt_probs", "isotonic_probs"),
     labels: tuple = ("Raw XGBoost", "Platt-calibrated", "Isotonic-calibrated"),
+    save_path: str = None,
 ) -> pd.DataFrame:
     """
     Builds the reliability diagram (calibration plot): x-axis is
@@ -195,6 +196,17 @@ def plot_reliability_diagram(
     rather than one fold at a time, since a single fold often has too
     few fights per probability bin to give a stable estimate of the
     true win rate in that bin.
+
+    save_path: if given, saves the figure to this path BEFORE
+    plt.show() is called. Some notebook/inline matplotlib backends
+    clear or close the current figure on show(), so saving after the
+    fact (e.g. a separate plt.savefig() call in the notebook, after
+    this function returns) can silently write a blank or near-empty
+    image - this was caught in Week 6 when a saved calibration PNG
+    came back at ~4.7KB (vs tens of KB expected) and rendered blank
+    inside the compiled tearsheet PDF. Saving inside the function,
+    against the actual figure object, avoids depending on matplotlib's
+    global "current figure" state at all.
     """
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect calibration")
@@ -240,6 +252,10 @@ def plot_reliability_diagram(
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
     plt.show()
 
     return pd.concat(all_bin_tables, ignore_index=True)
