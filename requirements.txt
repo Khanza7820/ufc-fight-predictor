@@ -1,9 +1,10 @@
-pandas
-numpy
-matplotlib
+pandas==3.0.3
+numpy==2.4.6
+matplotlib==3.10.9
 seaborn
-scikit-learn
-xgboost
-optuna
-shap
+scikit-learn==1.9.0
+xgboost==3.2.0
+optuna==4.9.0
+shap==0.52.0
 jupyterlab
+streamlit==1.64.0
