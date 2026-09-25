@@ -1,6 +1,8 @@
 # UFC Fight Outcome Predictor
 
-A calibrated machine-learning system for predicting UFC fight outcomes from pre-fight fighter statistics, built and evaluated using the same methodology a quantitative trading strategy would be: purged walk-forward cross-validation, probability calibration, an event-driven backtest against real historical bookmaker odds, and honest reporting of the result — including when that result is negative.
+A quantitative betting-research project on UFC fights, built and evaluated using the same methodology a trading strategy would be: purged walk-forward cross-validation, probability calibration, event-driven backtests against real bookmaker odds, pre-registered out-of-sample holdouts, and closing-line-value analysis.
+
+**Headline result: an early-line value strategy achieved +4.0% closing-line value (95% CI [+2.1%, +6.2%]) on a pre-registered out-of-sample holdout, with 83% of bets beating the closing line.** It was positive in every holdout month and on the development period (+2.3%, CI [+0.5%, +3.8%]). That makes it a statistically significant positive expected return of roughly +2% to +4% per bet. It was reached after four earlier false positives were identified and rejected (see [Results](#results)).
 
 ## Live Demo
 
@@ -9,6 +11,38 @@ A calibrated machine-learning system for predicting UFC fight outcomes from pre-
 ---
 
 ## Results
+
+### Week 10 (final result): early-line value betting against Pinnacle — positive, significant CLV
+
+Rather than out-predict the market, this strategy exploits slower bookmakers lagging Pinnacle, the sharpest book. It bets at the second-best available price when that price beats Pinnacle's de-vigged fair line by more than 2%, and it is scored by closing-line value (CLV), the professional standard for measuring edge.
+
+| | Development (Aug 2025–Mar 2026) | Holdout (Apr–Sep 2026) |
+|---|---|---|
+| Bets | 120 | 54 |
+| CLV vs. closing line | +2.3%, 95% CI [+0.5%, +3.8%] | **+4.0%, 95% CI [+2.1%, +6.2%]** |
+| Bets beating the close | 73% | 83% |
+
+A first version passed its holdout but was shown by a robustness check to be an artefact of the de-vig method; it was corrected and re-tested, and this is disclosed as a second look at the holdout. The caveats are real: small sample, prices scraped every ~1.5 days, and soft bookmakers limit winning accounts. Full write-up: [`reports/methodology.md`](reports/methodology.md#week-10-early-line-value-betting-against-pinnacle).
+
+### How the project got there
+
+Each earlier stage below was tested and rejected. Those rejections are what make the Week 10 result credible.
+
+#### Week 9: market-anchored model on a locked 5-year holdout
+
+The original model (below) forecast fights from scratch and lost to the bookmaker, whose line alone scores AUC 0.716. The redesign starts from the market's probability and learns only systematic corrections to it. It was developed on 2010–Mar 2021, pre-registered, then run **once** on fights it had never seen (Apr 2021–Mar 2026).
+
+| Holdout metric | Value |
+|---|---|
+| Bets | 1,026 (flat 1-unit stakes) |
+| ROI | **+4.4%** (+44.8 units), 95% CI [-2.8%, +11.8%] |
+| Log loss, model vs. market | **0.5898 vs. 0.5930** (beats the line) |
+| Max drawdown | -31.1 units |
+| Break-even price haircut | ~8% worse payouts |
+
+**Verdict for this model: no demonstrated bettable edge.** The holdout ROI was positive but not significant. A pre-registered closing-line-value test (108 bets, Aug 2025–Mar 2026, ~35 bookmakers including Pinnacle) then failed clearly: picks were worth **-4.0% against the closing line** (95% CI [-5.6%, -2.3%]), so the holdout profit was most likely variance. Method-of-victory props and three feature upgrades were tested on development data and rejected. Full write-up: [`reports/methodology.md`](reports/methodology.md#week-9-market-anchored-model-and-a-locked-holdout).
+
+#### Weeks 1–8: original from-scratch model
 
 | Metric | Value |
 |---|---|
@@ -19,11 +53,11 @@ A calibrated machine-learning system for predicting UFC fight outcomes from pre-
 | Backtest return vs. random betting | Model underperformed random betting |
 | Backtest return vs. always-bet-favourite | Model underperformed favourite-betting |
 
-**Headline finding: this project found no statistically significant edge against bookmaker odds.** The model's Sharpe ratio confidence interval includes zero, and a backtest restricted to the model's underdog-selection strategy underperformed both a random-betting baseline and a naive always-favourite baseline on the same out-of-sample fights.
+**Finding for this model: no statistically significant edge against bookmaker odds.** The model's Sharpe ratio confidence interval includes zero, and a backtest restricted to the model's underdog-selection strategy underperformed both a random-betting baseline and a naive always-favourite baseline on the same out-of-sample fights.
 
 This is reported as a negative/inconclusive result rather than forced into a favourable-looking headline number. An earlier version of this backtest appeared profitable (+109.9%, later +4.7% after fixing a model-reproducibility bug) — decomposing that result by year revealed it was driven almost entirely by a single anomalous year coinciding with the walk-forward CV's least-mature folds. Once that artifact was removed, the true result was negative. Full investigation, methodology, and the reasoning behind this conclusion are in [`reports/tearsheet.pdf`](reports/tearsheet.pdf) and the notebooks below.
 
-**Why this negative result is presented prominently rather than hidden:** the ability to design a rigorous validation and backtesting pipeline, catch a subtle non-reproducibility bug, decompose a misleading aggregate result into its true driver, and report an honest negative finding instead of a flattering but wrong one is itself the core skill this project set out to demonstrate — arguably more relevant to quantitative research roles than a clean positive number would have been.
+**Why the earlier negative results are kept:** catching a non-reproducibility bug, decomposing a misleading aggregate into its true driver, and rejecting false positives is what gives the final Week 10 result its credibility.
 
 ---
 
@@ -73,3 +107,56 @@ This is reported as a negative/inconclusive result rather than forced into a fav
 ---
 
 ## Repository structure
+
+ufc-fight-predictor/
+├── app/
+│ └── streamlit_app.py # Deployed dashboard
+├── data/
+│ ├── raw/ # Kaggle UFC dataset + bookmaker odds
+│ └── processed/ # Cleaned fights table, feature matrix
+├── notebooks/
+│ ├── 01_data_cleaning.ipynb
+│ ├── 02_feature_engineering.ipynb
+│ ├── 03_modelling.ipynb
+│ ├── 04_calibration.ipynb
+│ ├── 05_backtest.ipynb
+│ ├── 06_tearsheet.ipynb
+│ └── 07_dashboard_prep.ipynb
+├── reports/
+│ └── tearsheet.pdf # One-page results summary
+├── src/ # All modelling, backtest, and utility code
+└── requirements.txt
+
+
+## Running this project
+
+```bash
+pip install -r requirements.txt
+```
+
+Run notebooks `01` through `07` in order — each is self-contained and re-runs cleanly from a fresh kernel. To run the dashboard locally:
+
+```bash
+streamlit run app/streamlit_app.py
+```
+
+To reproduce the Week 9–10 results, run the scripts from `src/`. The Week 10 scripts need the Kaggle "UFC Betting Odds (Daily Updated Dataset)" (`kaggle datasets download -d jerzyszocik/ufc-betting-odds-daily-dataset`):
+
+```bash
+cd src
+python market_edge_holdout.py                          # Week 9 locked holdout
+python market_edge_clv.py <UFC_betting_odds.csv>       # Week 9 closing-line test
+python line_move.py <UFC_betting_odds.csv>             # Week 10 development research
+python line_move_holdout_v2.py <UFC_betting_odds.csv>  # Week 10 final holdout test
+```
+
+---
+
+## Extensions and future work
+
+- Forward-test the Week 10 strategy at live, bettable prices with continuous price monitoring, and measure realised profit alongside CLV.
+- Extend the Week 10 strategy to other MMA promotions for more betting volume.
+- Re-validate the underdog edge decile threshold on a genuinely held-out data slice, rather than the current in-sample selection (a documented limitation — see `reports/tearsheet.pdf`).
+- Test a larger initial walk-forward training window to reduce the variance in the earliest folds.
+- Bayesian ELO, ensemble methods, and regime detection, as noted above.
+- Live feature construction for arbitrary (non-historical) fighter matchups.
