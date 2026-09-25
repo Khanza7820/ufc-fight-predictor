@@ -10,8 +10,7 @@ what a real deployed system would have produced at the time. Using the
 final model here would be lookahead at the backtest stage: that model
 was trained on every fight including the ones being "bet on."
 
-Betting logic (Day 3-4 baseline - flat staking; Kelly sizing replaces
-this in kelly.py):
+Betting logic:
 1. For each fight in the test period, in chronological order:
 2. Compute edge on both sides: model probability minus bookmaker
    implied probability, for Red and for Blue.
@@ -20,9 +19,13 @@ this in kelly.py):
    the same fight is not a real edge, it's just paying the vig twice).
 4. If no side clears the threshold, no bet is placed - track bankroll
    unchanged for that fight.
-5. Stake is currently a FLAT fraction of current bankroll (placeholder
-   for Kelly sizing) - this lets the engine's core betting/outcome
-   logic be validated independently of the position-sizing formula.
+5. Stake sizing: either a FLAT fraction of current bankroll, or
+   fractional (half-)Kelly, selected via the REQUIRED `sizing_method`
+   argument (no default - see note in run_backtest). Kelly stake is
+   capped as a fraction of bankroll (`kelly_cap`) to control
+   concentration risk on long-odds underdog bets, which is exactly
+   where this model's edge lives (see Week 5 stratified decile
+   findings) and exactly where raw Kelly sizing spikes hardest.
 """
 
 import numpy as np
@@ -40,6 +43,49 @@ def american_to_decimal_odds(odds: float) -> float:
         return odds / 100 + 1
     else:
         return 100 / (-odds) + 1
+
+
+def kelly_fraction(
+    model_prob: float,
+    decimal_odds: float,
+    kelly_multiplier: float = 0.5,
+    cap: float = 0.05,
+) -> float:
+    """
+    Fractional Kelly stake, as a fraction of current bankroll.
+
+    f* = (b*p - q) / b   where b = decimal_odds - 1, q = 1 - p
+
+    model_prob        : model's win probability for the side being bet
+    decimal_odds       : decimal odds for that SAME side
+    kelly_multiplier   : 0.5 = half-Kelly (default). Full Kelly maximises
+                          long-run log growth but produces large
+                          drawdowns under real-world model-probability
+                          uncertainty (p is an estimate, not a known
+                          quantity) - half-Kelly roughly halves variance
+                          for a modest growth-rate cost, the standard
+                          practitioner tradeoff.
+    cap                 : hard ceiling on stake as a fraction of
+                          bankroll, applied AFTER the Kelly multiplier.
+                          Protects against single-bet concentration on
+                          high-odds underdogs, where f* can spike even
+                          under half-Kelly.
+
+    Returns 0.0 (never negative) if the raw edge doesn't support a bet -
+    edge_threshold in run_backtest() should already guarantee this, but
+    this is floored explicitly as a second line of defence, since f*
+    can land fractionally below zero from floating-point noise right at
+    a threshold boundary (the same class of bug already caught once in
+    this project's manual validation).
+    """
+    b = decimal_odds - 1
+    q = 1 - model_prob
+    f_star = (b * model_prob - q) / b
+
+    f = kelly_multiplier * f_star
+    f = max(0.0, f)
+    f = min(f, cap)
+    return f
 
 
 def generate_oos_predictions(
@@ -85,8 +131,11 @@ def generate_oos_predictions(
 
 def run_backtest(
     oos_with_odds: pd.DataFrame,
+    sizing_method: str,
     edge_threshold: float = 0.05,
-    stake_fraction: float = 0.01,
+    stake_fraction: float | None = None,
+    kelly_multiplier: float = 0.5,
+    kelly_cap: float = 0.05,
     initial_bankroll: float = 1000.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -97,6 +146,25 @@ def run_backtest(
     oos_with_odds must contain: model_prob, target, R_implied_prob,
     B_implied_prob, R_odds, B_odds, date (and id columns for logging).
 
+    sizing_method (REQUIRED, no default - see note below):
+        "kelly" - fractional Kelly (kelly_multiplier * f*), capped at
+            kelly_cap of current bankroll. Stake varies bet to bet with
+            both edge AND odds, not just bankroll size.
+        "flat" - stake_fraction * current bankroll on every bet
+            regardless of edge or odds. Kept for comparison against
+            Kelly (e.g. a flat-vs-Kelly bankroll curve for the
+            tearsheet) and because it's what the original manual
+            validation in __main__ was hand-calculated against.
+
+    WHY sizing_method HAS NO DEFAULT: an earlier version of this
+    function defaulted to "kelly", which meant a call that passed
+    stake_fraction but forgot sizing_method silently ran as Kelly and
+    ignored stake_fraction entirely - a real bug that produced a
+    confusing, wrong result (see Week 5 backtest notebook history).
+    Making sizing_method required, and validating stake_fraction
+    against it below, turns that mistake into an immediate error
+    instead of a silent wrong answer.
+
     Returns:
     - bankroll_history: one row per fight, with running bankroll
       (including no-bet fights, so the full timeline is visible)
@@ -104,6 +172,16 @@ def run_backtest(
       full detail (edge, side, stake, odds, outcome, profit) - this is
       what you manually spot-check against a few fights by hand.
     """
+    if sizing_method not in ("kelly", "flat"):
+        raise ValueError(f"sizing_method must be 'kelly' or 'flat', got {sizing_method!r}")
+    if sizing_method == "flat" and stake_fraction is None:
+        raise ValueError("sizing_method='flat' requires stake_fraction to be set.")
+    if sizing_method == "kelly" and stake_fraction is not None:
+        raise ValueError(
+            "stake_fraction was passed but sizing_method='kelly' ignores it - "
+            "did you mean sizing_method='flat'?"
+        )
+
     bankroll = initial_bankroll
     history_rows = []
     bet_rows = []
@@ -124,8 +202,24 @@ def run_backtest(
         if side is not None:
             odds = fight["R_odds"] if side == "Red" else fight["B_odds"]
             decimal_odds = american_to_decimal_odds(odds)
-            stake = bankroll * stake_fraction
+            side_model_prob = fight["model_prob"] if side == "Red" else 1 - fight["model_prob"]
 
+            if sizing_method == "kelly":
+                stake_frac = kelly_fraction(
+                    side_model_prob, decimal_odds,
+                    kelly_multiplier=kelly_multiplier, cap=kelly_cap,
+                )
+            else:
+                stake_frac = stake_fraction
+
+            stake = bankroll * stake_frac
+
+            # A bet that clears edge_threshold but sizes to ~0 stake
+            # (can happen right at the threshold boundary, or if the
+            # cap and multiplier combine to something tiny) is still
+            # logged as a bet with stake ~0 - it's a real decision the
+            # engine made, not a skipped fight, so it belongs in
+            # bet_log for an honest bet-rate count.
             won = (side == "Red" and fight["target"] == 1) or (side == "Blue" and fight["target"] == 0)
             profit = stake * (decimal_odds - 1) if won else -stake
             bankroll += profit
@@ -140,6 +234,7 @@ def run_backtest(
                 "edge": edge,
                 "odds_american": odds,
                 "decimal_odds": decimal_odds,
+                "stake_frac": stake_frac,
                 "stake": stake,
                 "won": won,
                 "profit": profit,
@@ -151,6 +246,7 @@ def run_backtest(
     bankroll_history = pd.DataFrame(history_rows)
     bet_log = pd.DataFrame(bet_rows)
 
+    print(f"Sizing method: {sizing_method}")
     print(f"Total fights evaluated: {len(oos_with_odds)}")
     print(f"Bets placed: {len(bet_log)} ({len(bet_log)/len(oos_with_odds):.1%} of fights)")
     print(f"Starting bankroll: {initial_bankroll:.2f}")
@@ -158,6 +254,9 @@ def run_backtest(
     print(f"Total return: {(bankroll/initial_bankroll - 1):+.1%}")
     if len(bet_log) > 0:
         print(f"Win rate on placed bets: {bet_log['won'].mean():.1%}")
+        if sizing_method == "kelly":
+            print(f"Mean stake as % of bankroll: {bet_log['stake_frac'].mean():.2%}")
+            print(f"Bets hitting the {kelly_cap:.0%} cap: {(bet_log['stake_frac'] >= kelly_cap - 1e-9).sum()}")
 
     return bankroll_history, bet_log
 
@@ -289,7 +388,7 @@ if __name__ == "__main__":
         "B_odds": [100, 100, 117, -140],
     })
 
-    print("=== Fight-by-fight manual check ===")
+    print("=== Fight-by-fight manual check (flat staking) ===")
     print(test_fights[["date", "model_prob", "R_implied_prob", "B_implied_prob"]].to_string())
     # Fight 1: edge_red = 0.70-0.55=0.15 (bet Red, threshold 0.05, odds -120 -> decimal 1.833)
     # Fight 2: edge_red = 0.30-0.55=-0.25, edge_blue = 0.70-0.50=0.20 (bet Blue, odds 100 -> decimal 2.0)
@@ -297,9 +396,10 @@ if __name__ == "__main__":
     # Fight 4: edge_red = 0.20-0.60=-0.40, edge_blue=0.80-0.44=0.36 (bet Blue, odds -140 -> decimal 1.714)
 
     bankroll_history, bet_log = run_backtest(
-        test_fights, edge_threshold=0.05, stake_fraction=0.10, initial_bankroll=1000.0
+        test_fights, sizing_method="flat", edge_threshold=0.05,
+        stake_fraction=0.10, initial_bankroll=1000.0,
     )
-    print("\n=== Bet log ===")
+    print("\n=== Bet log (flat) ===")
     print(bet_log[["date", "side_bet", "edge", "decimal_odds", "stake", "won", "profit", "bankroll_after"]].to_string())
 
     # Hand-computed expected trajectory (stake_fraction=0.10):
@@ -310,4 +410,34 @@ if __name__ == "__main__":
     assert len(bet_log) == 3, f"Expected 3 bets (fight 3 should be skipped), got {len(bet_log)}"
     assert abs(bankroll_history['bankroll'].iloc[-1] - 1276.78) < 1.0, \
         f"Final bankroll {bankroll_history['bankroll'].iloc[-1]:.2f} doesn't match hand-calculated ~1276.78"
-    print("\nAll manual validation checks PASSED.")
+    print("\nAll flat-staking manual validation checks PASSED.")
+
+    # --- Kelly sizing manual validation ---
+    # Fight 1: bet Red, p=0.70, decimal_odds=1.8333, b=0.8333, q=0.30
+    #   f* = (0.8333*0.70 - 0.30) / 0.8333 = (0.58333 - 0.30) / 0.8333 = 0.34
+    #   half-Kelly = 0.17 -> capped at kelly_cap=0.05 -> stake=1000*0.05=50.00, WON
+    #   profit = 50*0.8333 = 41.67 -> bankroll = 1041.67
+    f1 = kelly_fraction(0.70, 1.8333, kelly_multiplier=0.5, cap=0.05)
+    assert abs(f1 - 0.05) < 1e-4, f"Expected fight 1 Kelly frac to hit the 5% cap, got {f1:.4f}"
+
+    bankroll_history_k, bet_log_k = run_backtest(
+        test_fights, sizing_method="kelly", edge_threshold=0.05,
+        kelly_multiplier=0.5, kelly_cap=0.05, initial_bankroll=1000.0,
+    )
+    print("\n=== Bet log (Kelly) ===")
+    print(bet_log_k[["date", "side_bet", "edge", "decimal_odds", "stake_frac", "stake", "won", "profit", "bankroll_after"]].to_string())
+
+    # --- Validation that the missing/conflicting sizing_method args now error loudly ---
+    try:
+        run_backtest(test_fights, sizing_method="kelly", stake_fraction=0.01)
+        raise AssertionError("Expected ValueError when stake_fraction is passed with sizing_method='kelly'")
+    except ValueError as e:
+        print(f"\nCorrectly rejected conflicting args: {e}")
+
+    try:
+        run_backtest(test_fights, sizing_method="flat")
+        raise AssertionError("Expected ValueError when sizing_method='flat' has no stake_fraction")
+    except ValueError as e:
+        print(f"Correctly rejected missing stake_fraction: {e}")
+
+    print("\nAll validation checks PASSED.")

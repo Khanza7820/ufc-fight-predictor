@@ -31,6 +31,24 @@ Design decisions (documented for defense in an interview):
   forward loop. This is a legitimate simplification versus tuning
   fresh per fold (which would be extremely slow - 16 folds x N optuna
   trials each) and keeps the tuning process itself leakage-free.
+
+- FIXED RANDOM_STATE EVERYWHERE XGBOOST IS CONSTRUCTED. XGBoost's
+  tree-building involves randomness (e.g. feature/row subsampling
+  internals), so without a fixed seed, two runs of "the same"
+  experiment - same data, same hyperparameters - can produce
+  meaningfully different fitted models. This was caught empirically in
+  Week 5: re-running the walk-forward + backtest pipeline after a
+  kernel restart (same code, same data) produced swings from roughly
+  +110% to -37% total backtest return, which is far too large to be
+  explainable by legitimate randomness alone and made the entire
+  underdog-edge finding untrustworthy until fixed. random_state=42 is
+  set both inside the Optuna objective (so tuning itself is
+  deterministic) and explicitly added to the returned best_params dict
+  (study.best_params from Optuna only contains the tuned/suggested
+  values - n_estimators, max_depth, learning_rate - NOT fixed
+  parameters, so random_state must be added back in explicitly or it
+  silently reverts to XGBoost's default nondeterministic behaviour
+  everywhere best_params is later unpacked with **xgb_params).
 """
 
 import numpy as np
@@ -40,6 +58,8 @@ from xgboost import XGBClassifier
 from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss, accuracy_score
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)  # keep notebook output readable
+
+XGB_RANDOM_STATE = 42
 
 
 def tune_xgb_hyperparams(
@@ -57,7 +77,10 @@ def tune_xgb_hyperparams(
     outside train_idx (i.e. no test fold) is touched at any point.
 
     Returns the best hyperparameter dict found (minimizing log-loss on
-    the internal validation slice).
+    the internal validation slice), with random_state=XGB_RANDOM_STATE
+    explicitly included so every downstream model fit using this dict
+    is reproducible (see module docstring - this is NOT automatic,
+    Optuna's study.best_params only records the tuned parameters).
     """
     n = len(train_idx)
     split_point = int(n * (1 - inner_val_fraction))
@@ -75,18 +98,22 @@ def tune_xgb_hyperparams(
             "max_depth": trial.suggest_int("max_depth", 2, 8),
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
             "eval_metric": "logloss",
+            "random_state": XGB_RANDOM_STATE,
         }
         model = XGBClassifier(**params)
         model.fit(X_inner_train, y_inner_train)
         preds = model.predict_proba(X_inner_val)[:, 1]
         return log_loss(y_inner_val, preds, labels=[0, 1])
 
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=XGB_RANDOM_STATE))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
+    best_params = dict(study.best_params)
+    best_params["random_state"] = XGB_RANDOM_STATE
+
     print(f"Tuning complete: best internal log-loss = {study.best_value:.4f}")
-    print(f"Best params: {study.best_params}")
-    return study.best_params
+    print(f"Best params: {best_params}")
+    return best_params
 
 
 def train_and_evaluate_fold_xgb(
@@ -100,7 +127,16 @@ def train_and_evaluate_fold_xgb(
     Trains an XGBoost classifier with the given (already-tuned)
     hyperparameters on one fold's training data, scores it on that
     fold's test data. No imputation, no scaling - see module docstring.
+
+    xgb_params is expected to already include random_state (set by
+    tune_xgb_hyperparams). As a safety net, random_state is defaulted
+    here too via setdefault, in case xgb_params was constructed by hand
+    elsewhere (e.g. conservative_params in earlier diagnostic notebook
+    cells) without one.
     """
+    xgb_params = dict(xgb_params)
+    xgb_params.setdefault("random_state", XGB_RANDOM_STATE)
+
     X_train = df.iloc[train_idx][feature_cols]
     y_train = df.iloc[train_idx]["target"]
     X_test = df.iloc[test_idx][feature_cols]
